@@ -1,0 +1,1945 @@
+--- a/examples/demo_deform.py
++++ b/examples/demo_deform.py
+@@ -74,7 +74,9 @@
+ 
+     os.makedirs(args.output_dir, exist_ok=True)
+ 
+-    model = Model(args.template_mesh).cuda()
++    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++
++    model = Model(args.template_mesh).to(device)
+     transform = sr.LookAt(viewing_angle=15)
+     lighting = sr.Lighting()
+     rasterizer = sr.SoftRasterizer(image_size=64, sigma_val=1e-4, aggr_func_rgb='hard')
+@@ -92,7 +94,7 @@
+     loop = tqdm.tqdm(list(range(0, 2000)))
+     writer = imageio.get_writer(os.path.join(args.output_dir, 'deform.gif'), mode='I')
+     for i in loop:
+-        images_gt = torch.from_numpy(images).cuda()
++        images_gt = torch.from_numpy(images).to(device)
+ 
+         mesh, laplacian_loss, flatten_loss = model(args.batch_size)
+ 
+--- a/examples/recon/models.py
++++ b/examples/recon/models.py
+@@ -139,7 +139,7 @@
+     def evaluate_iou(self, images, voxels):
+         vertices, faces = self.reconstruct(images)
+ 
+-        faces_ = srf.face_vertices(vertices, faces).data
++        faces_ = srf.face_vertices(vertices, faces).detach()
+         faces_norm = faces_ * 1. * (32. - 1) / 32. + 0.5
+         voxels_predict = srf.voxelization(faces_norm, 32, False).cpu().numpy()
+         voxels_predict = voxels_predict.transpose(0, 2, 1, 3)[:, :, :, ::-1]
+--- a/examples/recon/models_large.py
++++ b/examples/recon/models_large.py
+@@ -148,7 +148,7 @@
+     def evaluate_iou(self, images, voxels):
+         vertices, faces = self.reconstruct(images)
+ 
+-        faces_ = srf.face_vertices(vertices, faces).data
++        faces_ = srf.face_vertices(vertices, faces).detach()
+         faces_norm = faces_ * 1. * (32. - 1) / 32. + 0.5
+         voxels_predict = srf.voxelization(faces_norm, 32, False).cpu().numpy()
+         voxels_predict = voxels_predict.transpose(0, 2, 1, 3)[:, :, :, ::-1]
+--- a/examples/recon/test.py
++++ b/examples/recon/test.py
+@@ -51,9 +51,10 @@
+     model = models_large.Model('data/obj/sphere/sphere_642.obj', args=args)
+ else:
+     model = models.Model('data/obj/sphere/sphere_642.obj', args=args)
+-model = model.cuda()
++device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++model = model.to(device)
+ 
+-state_dicts = torch.load(args.model_directory)
++state_dicts = torch.load(args.model_directory, map_location=device)
+ # import ipdb; ipdb.set_trace()
+ model.load_state_dict(state_dicts['model'], strict=True)
+ model.eval()
+@@ -83,7 +84,7 @@
+         iou = 0
+ 
+         for i, (im, vx) in enumerate(dataset_val.get_all_batches_for_evaluation(args.batch_size, class_id)):
+-            images = torch.autograd.Variable(im).cuda()
++            images = im.to(device)
+             voxels = vx.numpy()
+ 
+             batch_iou, vertices, faces = model(images, voxels=voxels, task='test')
+--- a/examples/recon/train.py
++++ b/examples/recon/train.py
+@@ -73,14 +73,16 @@
+ os.makedirs(image_output, exist_ok=True)
+ 
+ # setup model & optimizer
++device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++
+ model = models.Model('data/obj/sphere/sphere_642.obj', args=args)
+-model = model.cuda()
++model = model.to(device)
+ 
+ optimizer = torch.optim.Adam(model.model_param(), args.learning_rate)
+ 
+ start_iter = START_ITERATION
+ if args.resume_path:
+-    state_dicts = torch.load(args.resume_path)
++    state_dicts = torch.load(args.resume_path, map_location=device)
+     model.load_state_dict(state_dicts['model'])
+     optimizer.load_state_dict(state_dicts['optimizer'])
+     start_iter = int(os.path.split(args.resume_path)[1][11:].split('.')[0]) + 1
+@@ -102,10 +104,10 @@
+ 
+         # load images from multi-view
+         images_a, images_b, viewpoints_a, viewpoints_b = dataset_train.get_random_batch(args.batch_size)
+-        images_a = images_a.cuda()
+-        images_b = images_b.cuda()
+-        viewpoints_a = viewpoints_a.cuda()
+-        viewpoints_b = viewpoints_b.cuda()
++        images_a = images_a.to(device)
++        images_b = images_b.to(device)
++        viewpoints_a = viewpoints_a.to(device)
++        viewpoints_b = viewpoints_b.to(device)
+ 
+         # soft render images
+         render_images, laplacian_loss, flatten_loss = model([images_a, images_b],
+@@ -118,7 +120,7 @@
+         loss = multiview_iou_loss(render_images, images_a, images_b) + \
+             args.lambda_laplacian * laplacian_loss + \
+             args.lambda_flatten * flatten_loss
+-        losses.update(loss.data.item(), images_a.size(0))
++        losses.update(loss.item(), images_a.size(0))
+ 
+         # compute gradient and optimize
+         optimizer.zero_grad()
+--- a/setup.py
++++ b/setup.py
+@@ -1,29 +1,46 @@
+-from setuptools import setup, find_packages
++from setuptools import find_packages, setup
+ 
+ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+ 
+-CUDA_FLAGS = []
+ 
+ ext_modules = [
+-    CUDAExtension('soft_renderer.cuda.load_textures', [
+-        'soft_renderer/cuda/load_textures_cuda.cpp',
+-        'soft_renderer/cuda/load_textures_cuda_kernel.cu',
+-        ]),
+-    CUDAExtension('soft_renderer.cuda.create_texture_image', [
+-        'soft_renderer/cuda/create_texture_image_cuda.cpp',
+-        'soft_renderer/cuda/create_texture_image_cuda_kernel.cu',
+-        ]),
+-    CUDAExtension('soft_renderer.cuda.soft_rasterize', [
+-        'soft_renderer/cuda/soft_rasterize_cuda.cpp',
+-        'soft_renderer/cuda/soft_rasterize_cuda_kernel.cu',
+-        ]),
+-    CUDAExtension('soft_renderer.cuda.voxelization', [
+-        'soft_renderer/cuda/voxelization_cuda.cpp',
+-        'soft_renderer/cuda/voxelization_cuda_kernel.cu',
+-        ]),
+-    ]
++    CUDAExtension(
++        'soft_renderer.cuda.load_textures',
++        [
++            'soft_renderer/cuda/load_textures_cuda.cpp',
++            'soft_renderer/cuda/load_textures_cuda_kernel.cu',
++        ],
++    ),
++    CUDAExtension(
++        'soft_renderer.cuda.create_texture_image',
++        [
++            'soft_renderer/cuda/create_texture_image_cuda.cpp',
++            'soft_renderer/cuda/create_texture_image_cuda_kernel.cu',
++        ],
++    ),
++    CUDAExtension(
++        'soft_renderer.cuda.soft_rasterize',
++        [
++            'soft_renderer/cuda/soft_rasterize_cuda.cpp',
++            'soft_renderer/cuda/soft_rasterize_cuda_kernel.cu',
++        ],
++    ),
++    CUDAExtension(
++        'soft_renderer.cuda.voxelization',
++        [
++            'soft_renderer/cuda/voxelization_cuda.cpp',
++            'soft_renderer/cuda/voxelization_cuda_kernel.cu',
++        ],
++    ),
++]
+ 
+-INSTALL_REQUIREMENTS = ['numpy', 'torch', 'torchvision', 'scikit-image', 'tqdm', 'imageio']
++INSTALL_REQUIREMENTS = [
++    'numpy',
++    'torch',
++    'scikit-image',
++    'tqdm',
++    'imageio',
++]
+ 
+ setup(
+     description='PyTorch implementation of "Soft Rasterizer"',
+@@ -32,8 +49,9 @@
+     license='MIT License',
+     version='1.0.0',
+     name='soft_renderer',
+-    packages=['soft_renderer', 'soft_renderer.cuda', 'soft_renderer.functional'],
++    packages=find_packages(include=('soft_renderer', 'soft_renderer.*')),
+     install_requires=INSTALL_REQUIREMENTS,
+     ext_modules=ext_modules,
+-    cmdclass={'build_ext': BuildExtension}
++    cmdclass={'build_ext': BuildExtension},
++    zip_safe=False,
+ )
+--- a/soft_renderer/cuda/create_texture_image_cuda.cpp
++++ b/soft_renderer/cuda/create_texture_image_cuda.cpp
+@@ -1,4 +1,6 @@
+-#include <torch/torch.h>
++#include <torch/extension.h>
++
++#include <c10/cuda/CUDAGuard.h>
+ 
+ // CUDA forward declarations
+ 
+@@ -10,10 +12,14 @@
+ 
+ // C++ interface
+ 
+-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+-
++#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
++#define CHECK_FLOATING(x) TORCH_CHECK(at::isFloatingType((x).scalar_type()), #x " must be a floating point tensor")
++#define CHECK_INPUT(x) \
++    CHECK_CUDA(x);     \
++    CHECK_CONTIGUOUS(x)
++#define CHECK_SAME_DEVICE(x, y) TORCH_CHECK((x).device() == (y).device(), #x " and " #y " must be on the same device")
++#define CHECK_SAME_DTYPE(x, y) TORCH_CHECK((x).scalar_type() == (y).scalar_type(), #x " and " #y " must have the same dtype")
+ 
+ at::Tensor create_texture_image(
+         at::Tensor vertices_all,
+@@ -24,11 +30,18 @@
+     CHECK_INPUT(vertices_all);
+     CHECK_INPUT(textures);
+     CHECK_INPUT(image);
+-    
++    CHECK_FLOATING(vertices_all);
++    CHECK_FLOATING(textures);
++    CHECK_FLOATING(image);
++    CHECK_SAME_DEVICE(vertices_all, textures);
++    CHECK_SAME_DEVICE(vertices_all, image);
++    CHECK_SAME_DTYPE(vertices_all, textures);
++    CHECK_SAME_DTYPE(vertices_all, image);
++
++    const c10::cuda::CUDAGuard device_guard(vertices_all.device());
+     return create_texture_image_cuda(vertices_all, textures, image, eps);
+ }
+ 
+-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ PYBIND11_MODULE(create_texture_image, m) {
+     m.def("create_texture_image", &create_texture_image, "CREATE_TEXTURE_IMAGE (CUDA)");
+ }
+--- a/soft_renderer/cuda/create_texture_image_cuda_kernel.cu
++++ b/soft_renderer/cuda/create_texture_image_cuda_kernel.cu
+@@ -1,4 +1,7 @@
+ #include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++
++#include <c10/cuda/CUDAException.h>
+ 
+ #include <cmath>
+ 
+@@ -6,7 +9,7 @@
+ #include <cuda_runtime.h>
+ 
+ namespace {
+-template<typename scalar_t>
++template <typename scalar_t>
+ __global__ void create_texture_image_cuda_kernel(
+         const scalar_t* __restrict__ faces,
+         const scalar_t* __restrict__ textures,
+@@ -26,9 +29,9 @@
+     const int fn = row + column * tile_width;
+     const int R = texture_res_in;
+ 
+-    // if (fn >= num_faces || (y % texture_res_out) < (x % texture_res_out))
+-    if (fn >= num_faces)
++    if (fn >= num_faces) {
+         return;
++    }
+ 
+     const scalar_t* texture = &textures[fn * R * R * 3];
+     const scalar_t* vertices = &faces[fn * 3 * 2];
+@@ -45,31 +48,36 @@
+         p2[0] * (p0[1] - p1[1]) +
+         p0[0] * (p1[1] - p2[1]) +
+         p1[0] * (p2[1] - p0[1]));
+-    for (int k = 0; k < 9; k++) face_inv[k] /= (face_inv_denominator + eps);
++    for (int k = 0; k < 9; k++) {
++        face_inv[k] /= (face_inv_denominator + eps);
++    }
+ 
+     /* compute w = face_inv * p */
+     scalar_t w[3];
+     scalar_t w_sum = 0;
+     for (int k = 0; k < 3; k++) {
+         w[k] = face_inv[3 * k + 0] * x + face_inv[3 * k + 1] * y + face_inv[3 * k + 2];
+-        w[k] = max(min(w[k], 1.), 0.);
++        w[k] = max(min(w[k], scalar_t(1.0)), scalar_t(0.0));
+         w_sum += w[k];
+     }
+-    for (int k = 0; k < 3; k++)
++    for (int k = 0; k < 3; k++) {
+         w[k] /= (w_sum + eps);
++    }
+ 
+     const int w_x = w[0] * R;
+     const int w_y = w[1] * R;
+     if ((w[0] + w[1]) * R - w_x - w_y <= 1) {
+-        for (int k = 0; k < 3; k++)
++        for (int k = 0; k < 3; k++) {
+             image[i * 3 + k] = texture[(w_y * R + w_x) * 3 + k];
++        }
+     } else {
+-        for (int k = 0; k < 3; k++)
++        for (int k = 0; k < 3; k++) {
+             image[i * 3 + k] = texture[((R - 1 - w_y) * R + (R - 1 - w_x)) * 3 + k];
++        }
+     }
+ }
+ 
+-}
++} // namespace
+ 
+ at::Tensor create_texture_image_cuda(
+         at::Tensor faces,
+@@ -78,30 +86,28 @@
+         float eps) {
+ 
+     const auto num_faces = textures.size(0);
+-    const auto texture_res_in = int(sqrt(textures.size(1)));
+-    const auto tile_width = int(sqrt(num_faces - 1)) + 1;
++    const auto texture_res_in = static_cast<int>(std::sqrt(static_cast<double>(textures.size(1))));
++    const auto tile_width = static_cast<int>(std::sqrt(static_cast<double>(num_faces - 1))) + 1;
+     const auto texture_res_out = image.size(1) / tile_width;
+ 
+     const int threads = 1024;
+     const int image_size = image.numel();
+-    const dim3 blocks ((image_size / 3 - 1) / threads + 1);
++    const dim3 blocks((image_size / 3 - 1) / threads + 1);
++    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+     AT_DISPATCH_FLOATING_TYPES(image.scalar_type(), "create_texture_image_cuda", ([&] {
+-      create_texture_image_cuda_kernel<scalar_t><<<blocks, threads>>>(
+-          faces.data_ptr<scalar_t>(),
+-          textures.data_ptr<scalar_t>(),
+-          image.data_ptr<scalar_t>(),
+-          image_size,
+-          num_faces,
+-          texture_res_in,
+-          texture_res_out,
+-          tile_width,
+-          (scalar_t) eps);
+-      }));
++        create_texture_image_cuda_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
++            faces.data_ptr<scalar_t>(),
++            textures.data_ptr<scalar_t>(),
++            image.data_ptr<scalar_t>(),
++            image_size,
++            num_faces,
++            texture_res_in,
++            texture_res_out,
++            tile_width,
++            static_cast<scalar_t>(eps));
++    }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-        printf("Error in create_texture_image: %s\n", cudaGetErrorString(err));
+-
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return image;
+ }
+--- a/soft_renderer/cuda/load_textures_cuda.cpp
++++ b/soft_renderer/cuda/load_textures_cuda.cpp
+@@ -1,4 +1,6 @@
+-#include <torch/torch.h>
++#include <torch/extension.h>
++
++#include <c10/cuda/CUDAGuard.h>
+ 
+ // CUDA forward declarations
+ 
+@@ -10,10 +12,15 @@
+ 
+ // C++ interface
+ 
+-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+-
++#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
++#define CHECK_FLOATING(x) TORCH_CHECK(at::isFloatingType((x).scalar_type()), #x " must be a floating point tensor")
++#define CHECK_INT32(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be an int32 tensor")
++#define CHECK_INPUT(x) \
++    CHECK_CUDA(x);     \
++    CHECK_CONTIGUOUS(x)
++#define CHECK_SAME_DEVICE(x, y) TORCH_CHECK((x).device() == (y).device(), #x " and " #y " must be on the same device")
++#define CHECK_SAME_DTYPE(x, y) TORCH_CHECK((x).scalar_type() == (y).scalar_type(), #x " and " #y " must have the same dtype")
+ 
+ at::Tensor load_textures(
+         at::Tensor image,
+@@ -25,12 +32,20 @@
+     CHECK_INPUT(faces);
+     CHECK_INPUT(is_update);
+     CHECK_INPUT(textures);
++    CHECK_FLOATING(image);
++    CHECK_FLOATING(faces);
++    CHECK_FLOATING(textures);
++    CHECK_INT32(is_update);
++    CHECK_SAME_DEVICE(image, faces);
++    CHECK_SAME_DEVICE(image, textures);
++    CHECK_SAME_DEVICE(image, is_update);
++    CHECK_SAME_DTYPE(image, faces);
++    CHECK_SAME_DTYPE(image, textures);
+ 
++    const c10::cuda::CUDAGuard device_guard(image.device());
+     return load_textures_cuda(image, faces, textures, is_update);
+-                                      
+ }
+ 
+-//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ PYBIND11_MODULE(load_textures, m) {
+     m.def("load_textures", &load_textures, "LOAD_TEXTURES (CUDA)");
+ }
+--- a/soft_renderer/cuda/load_textures_cuda_kernel.cu
++++ b/soft_renderer/cuda/load_textures_cuda_kernel.cu
+@@ -1,4 +1,9 @@
+ #include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++
++#include <c10/cuda/CUDAException.h>
++
++#include <cmath>
+ 
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -9,7 +14,7 @@
+     const scalar_t* __restrict__ image,
+     const scalar_t* __restrict__ faces,
+     const int32_t* __restrict__ is_update,
+-    scalar_t* __restrict__ textures, 
++    scalar_t* __restrict__ textures,
+     size_t texture_size,
+     size_t texture_res,
+     size_t image_height,
+@@ -25,34 +30,36 @@
+   // compute barycentric coordinate
+   scalar_t w0, w1, w2;
+   if (w_x + w_y < R) {
+-      w0 = (w_x + 1. / 3.) / R;
+-      w1 = (w_y + 1. / 3.) / R;
++      w0 = (w_x + scalar_t(1.0 / 3.0)) / R;
++      w1 = (w_y + scalar_t(1.0 / 3.0)) / R;
+       w2 = 1. - w0 - w1;
+   } else {
+-      w0 = ((R - 1. - w_x) + 2. / 3.) / R;
+-      w1 = ((R - 1. - w_y) + 2. / 3.) / R;
++      w0 = ((R - 1. - w_x) + scalar_t(2.0 / 3.0)) / R;
++      w1 = ((R - 1. - w_y) + scalar_t(2.0 / 3.0)) / R;
+       w2 = 1. - w0 - w1;
+   }
+   const scalar_t* face = &faces[fn * 3 * 2];
+   scalar_t* texture = &textures[i * 3];
+-  if (is_update[fn] == 0) return;
+-  
++  if (is_update[fn] == 0) {
++      return;
++  }
++
+   const scalar_t pos_x = (
+       (face[2 * 0 + 0] * w0 + face[2 * 1 + 0] * w1 + face[2 * 2 + 0] * w2) * (image_width - 1));
+   const scalar_t pos_y = (
+       (face[2 * 0 + 1] * w0 + face[2 * 1 + 1] * w1 + face[2 * 2 + 1] * w2) * (image_height - 1));
+   if (1) {
+       /* bilinear sampling */
+-      const scalar_t weight_x1 = pos_x - (int)pos_x;
++      const scalar_t weight_x1 = pos_x - static_cast<int>(pos_x);
+       const scalar_t weight_x0 = 1 - weight_x1;
+-      const scalar_t weight_y1 = pos_y - (int)pos_y;
++      const scalar_t weight_y1 = pos_y - static_cast<int>(pos_y);
+       const scalar_t weight_y0 = 1 - weight_y1;
+       for (int k = 0; k < 3; k++) {
+           scalar_t c = 0;
+-          c += image[((int)pos_y * image_width + (int)pos_x) * 3 + k] * (weight_x0 * weight_y0);
+-          c += image[((int)(pos_y + 1) * image_width + (int)pos_x) * 3 + k] * (weight_x0 * weight_y1);
+-          c += image[((int)pos_y * image_width + ((int)pos_x) + 1) * 3 + k] * (weight_x1 * weight_y0);
+-          c += image[((int)(pos_y + 1)* image_width + ((int)pos_x) + 1) * 3 + k] * (weight_x1 * weight_y1);
++          c += image[((static_cast<int>(pos_y) * image_width) + static_cast<int>(pos_x)) * 3 + k] * (weight_x0 * weight_y0);
++          c += image[((static_cast<int>(pos_y + 1) * image_width) + static_cast<int>(pos_x)) * 3 + k] * (weight_x0 * weight_y1);
++          c += image[((static_cast<int>(pos_y) * image_width) + static_cast<int>(pos_x) + 1) * 3 + k] * (weight_x1 * weight_y0);
++          c += image[((static_cast<int>(pos_y + 1) * image_width) + static_cast<int>(pos_x) + 1) * 3 + k] * (weight_x1 * weight_y1);
+           texture[k] = c;
+       }
+   } else {
+@@ -64,7 +71,7 @@
+       }
+   }
+ }
+-}
++} // namespace
+ 
+ at::Tensor load_textures_cuda(
+         at::Tensor image,
+@@ -73,28 +80,26 @@
+         at::Tensor is_update) {
+     // texture_size = size of the textures tensor
+     const auto texture_size = textures.numel();
+-    // notice that texture_res != texture_res
+-    const auto texture_res = sqrt(textures.size(1));
++    const auto texture_res = static_cast<int>(std::sqrt(static_cast<double>(textures.size(1))));
+     const auto image_height = image.size(0);
+     const auto image_width = image.size(1);
+-    
++
+     const int threads = 1024;
+-    const dim3 blocks ((texture_size / 3 - 1) / threads + 1);
++    const dim3 blocks((texture_size / 3 - 1) / threads + 1);
++    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+     AT_DISPATCH_FLOATING_TYPES(image.scalar_type(), "load_textures_cuda", ([&] {
+-      load_textures_cuda_kernel<scalar_t><<<blocks, threads>>>(
+-          image.data_ptr<scalar_t>(),
+-          faces.data_ptr<scalar_t>(),
+-          is_update.data_ptr<int32_t>(),
+-          textures.data_ptr<scalar_t>(),
+-          texture_size,
+-          texture_res,
+-          image_height,
+-          image_width);
+-      }));
++        load_textures_cuda_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
++            image.data_ptr<scalar_t>(),
++            faces.data_ptr<scalar_t>(),
++            is_update.data_ptr<int32_t>(),
++            textures.data_ptr<scalar_t>(),
++            texture_size,
++            texture_res,
++            image_height,
++            image_width);
++    }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in load_textures: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+     return textures;
+ }
+--- a/soft_renderer/cuda/soft_rasterize_cuda.cpp
++++ b/soft_renderer/cuda/soft_rasterize_cuda.cpp
+@@ -1,12 +1,11 @@
+-#include <torch/torch.h>
++#include <torch/extension.h>
++
++#include <c10/cuda/CUDAGuard.h>
+ 
+ #include <vector>
+ 
+-#include <iostream>
+-
+ // CUDA forward declarations
+ 
+-
+ std::vector<at::Tensor> forward_soft_rasterize_cuda(
+         at::Tensor faces,
+         at::Tensor textures,
+@@ -26,11 +25,10 @@
+         int texture_sample_type,
+         bool double_side);
+ 
+-
+ std::vector<at::Tensor> backward_soft_rasterize_cuda(
+         at::Tensor faces,
+         at::Tensor textures,
+-        at::Tensor soft_colors,        
++        at::Tensor soft_colors,
+         at::Tensor faces_info,
+         at::Tensor aggrs_info,
+         at::Tensor grad_faces,
+@@ -51,10 +49,14 @@
+ 
+ // C++ interface
+ 
+-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+-
++#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
++#define CHECK_FLOATING(x) TORCH_CHECK(at::isFloatingType((x).scalar_type()), #x " must be a floating point tensor")
++#define CHECK_INPUT(x) \
++    CHECK_CUDA(x);     \
++    CHECK_CONTIGUOUS(x)
++#define CHECK_SAME_DEVICE(x, y) TORCH_CHECK((x).device() == (y).device(), #x " and " #y " must be on the same device")
++#define CHECK_SAME_DTYPE(x, y) TORCH_CHECK((x).scalar_type() == (y).scalar_type(), #x " and " #y " must have the same dtype")
+ 
+ std::vector<at::Tensor> forward_soft_rasterize(
+         at::Tensor faces,
+@@ -80,16 +82,40 @@
+     CHECK_INPUT(faces_info);
+     CHECK_INPUT(aggrs_info);
+     CHECK_INPUT(soft_colors);
+-
+-    return forward_soft_rasterize_cuda(faces, textures, 
+-                                       faces_info, aggrs_info, 
+-                                       soft_colors, 
+-                                       image_size, near, far, eps, 
+-                                       sigma_val, func_id_dist, dist_eps,
+-                                       gamma_val, func_id_rgb, func_id_alpha, 
+-                                       texture_sample_type, double_side);
++    CHECK_FLOATING(faces);
++    CHECK_FLOATING(textures);
++    CHECK_FLOATING(faces_info);
++    CHECK_FLOATING(aggrs_info);
++    CHECK_FLOATING(soft_colors);
++    CHECK_SAME_DEVICE(faces, textures);
++    CHECK_SAME_DEVICE(faces, faces_info);
++    CHECK_SAME_DEVICE(faces, aggrs_info);
++    CHECK_SAME_DEVICE(faces, soft_colors);
++    CHECK_SAME_DTYPE(faces, textures);
++    CHECK_SAME_DTYPE(faces, faces_info);
++    CHECK_SAME_DTYPE(faces, aggrs_info);
++    CHECK_SAME_DTYPE(faces, soft_colors);
++
++    const c10::cuda::CUDAGuard device_guard(faces.device());
++    return forward_soft_rasterize_cuda(
++        faces,
++        textures,
++        faces_info,
++        aggrs_info,
++        soft_colors,
++        image_size,
++        near,
++        far,
++        eps,
++        sigma_val,
++        func_id_dist,
++        dist_eps,
++        gamma_val,
++        func_id_rgb,
++        func_id_alpha,
++        texture_sample_type,
++        double_side);
+ }
+-
+ 
+ std::vector<at::Tensor> backward_soft_rasterize(
+         at::Tensor faces,
+@@ -121,16 +147,52 @@
+     CHECK_INPUT(grad_faces);
+     CHECK_INPUT(grad_textures);
+     CHECK_INPUT(grad_soft_colors);
+-
+-    return backward_soft_rasterize_cuda(faces, textures, soft_colors, 
+-                                        faces_info, aggrs_info, 
+-                                        grad_faces, grad_textures, grad_soft_colors, 
+-                                        image_size, near, far, eps, 
+-                                        sigma_val, func_id_dist, dist_eps,
+-                                        gamma_val, func_id_rgb, func_id_alpha, 
+-                                        texture_sample_type, double_side);
++    CHECK_FLOATING(faces);
++    CHECK_FLOATING(textures);
++    CHECK_FLOATING(soft_colors);
++    CHECK_FLOATING(faces_info);
++    CHECK_FLOATING(aggrs_info);
++    CHECK_FLOATING(grad_faces);
++    CHECK_FLOATING(grad_textures);
++    CHECK_FLOATING(grad_soft_colors);
++    CHECK_SAME_DEVICE(faces, textures);
++    CHECK_SAME_DEVICE(faces, soft_colors);
++    CHECK_SAME_DEVICE(faces, faces_info);
++    CHECK_SAME_DEVICE(faces, aggrs_info);
++    CHECK_SAME_DEVICE(faces, grad_faces);
++    CHECK_SAME_DEVICE(faces, grad_textures);
++    CHECK_SAME_DEVICE(faces, grad_soft_colors);
++    CHECK_SAME_DTYPE(faces, textures);
++    CHECK_SAME_DTYPE(faces, soft_colors);
++    CHECK_SAME_DTYPE(faces, faces_info);
++    CHECK_SAME_DTYPE(faces, aggrs_info);
++    CHECK_SAME_DTYPE(faces, grad_faces);
++    CHECK_SAME_DTYPE(faces, grad_textures);
++    CHECK_SAME_DTYPE(faces, grad_soft_colors);
++
++    const c10::cuda::CUDAGuard device_guard(faces.device());
++    return backward_soft_rasterize_cuda(
++        faces,
++        textures,
++        soft_colors,
++        faces_info,
++        aggrs_info,
++        grad_faces,
++        grad_textures,
++        grad_soft_colors,
++        image_size,
++        near,
++        far,
++        eps,
++        sigma_val,
++        func_id_dist,
++        dist_eps,
++        gamma_val,
++        func_id_rgb,
++        func_id_alpha,
++        texture_sample_type,
++        double_side);
+ }
+-
+ 
+ PYBIND11_MODULE(soft_rasterize, m) {
+     m.def("forward_soft_rasterize", &forward_soft_rasterize, "FORWARD_SOFT_RASTERIZE (CUDA)");
+--- a/soft_renderer/cuda/soft_rasterize_cuda_kernel.cu
++++ b/soft_renderer/cuda/soft_rasterize_cuda_kernel.cu
+@@ -1,10 +1,15 @@
+ #include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++
++#include <c10/cuda/CUDAException.h>
++
++#include <cmath>
+ 
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+ 
+ // for the older gpus atomicAdd with double arguments does not exist
+-#if  __CUDA_ARCH__ < 600 and defined(__CUDA_ARCH__)
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
+ static __inline__ __device__ double atomicAdd(double* address, double val) {
+     unsigned long long int* address_as_ull = (unsigned long long int*)address;
+     unsigned long long int old = *address_as_ull, assumed;
+@@ -669,7 +674,8 @@
+     const dim3 blocks_1 ((batch_size * num_faces - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "forward_soft_rasterize_inv_cuda", ([&] {
+-      forward_soft_rasterize_inv_cuda_kernel<scalar_t><<<blocks_1, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      forward_soft_rasterize_inv_cuda_kernel<scalar_t><<<blocks_1, threads, 0, stream>>>(
+           faces.data_ptr<scalar_t>(),
+           faces_info.data_ptr<scalar_t>(),
+           batch_size,
+@@ -677,14 +683,13 @@
+           image_size);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in forward_transform_inv_triangle: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     const dim3 blocks_2 ((batch_size * image_size * image_size - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "forward_eff_soft_rasterize_cuda", ([&] {
+-      forward_soft_rasterize_cuda_kernel<scalar_t><<<blocks_2, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      forward_soft_rasterize_cuda_kernel<scalar_t><<<blocks_2, threads, 0, stream>>>(
+           faces.data_ptr<scalar_t>(),
+           textures.data_ptr<scalar_t>(),
+           faces_info.data_ptr<scalar_t>(),
+@@ -708,9 +713,7 @@
+           double_side);
+       }));
+ 
+-    err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-        printf("Error in forward_soft_rasterize: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {faces_info, aggrs_info, soft_colors};
+ }
+@@ -746,7 +749,8 @@
+     const dim3 blocks ((batch_size * image_size * image_size - 1) / threads + 1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "backward_soft_rasterize_cuda", ([&] {
+-      backward_soft_rasterize_cuda_kernel<scalar_t><<<blocks, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      backward_soft_rasterize_cuda_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           faces.data_ptr<scalar_t>(),
+           textures.data_ptr<scalar_t>(),
+           soft_colors.data_ptr<scalar_t>(),
+@@ -773,9 +777,7 @@
+           double_side);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-        printf("Error in backward_soft_rasterize: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {grad_faces, grad_textures};
+ }
+--- a/soft_renderer/cuda/voxelization_cuda.cpp
++++ b/soft_renderer/cuda/voxelization_cuda.cpp
+@@ -1,4 +1,6 @@
+-#include <torch/torch.h>
++#include <torch/extension.h>
++
++#include <c10/cuda/CUDAGuard.h>
+ 
+ #include <vector>
+ 
+@@ -8,38 +10,41 @@
+         at::Tensor faces,
+         at::Tensor voxels);
+ 
+-
+ std::vector<at::Tensor> voxelize_sub2_cuda(
+         at::Tensor faces,
+         at::Tensor voxels);
+-
+ 
+ std::vector<at::Tensor> voxelize_sub3_cuda(
+         at::Tensor faces,
+         at::Tensor voxels,
+         at::Tensor visible);
+ 
+-
+ std::vector<at::Tensor> voxelize_sub4_cuda(
+         at::Tensor faces,
+         at::Tensor voxels,
+         at::Tensor visible);
+ 
+-
+-
+ // C++ interface
+ 
+-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+-
++#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
++#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
++#define CHECK_FLOATING(x) TORCH_CHECK(at::isFloatingType((x).scalar_type()), #x " must be a floating point tensor")
++#define CHECK_INT32(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be an int32 tensor")
++#define CHECK_INPUT(x) \
++    CHECK_CUDA(x);     \
++    CHECK_CONTIGUOUS(x)
++#define CHECK_SAME_DEVICE(x, y) TORCH_CHECK((x).device() == (y).device(), #x " and " #y " must be on the same device")
+ 
+ std::vector<at::Tensor> voxelize_sub1(
+         at::Tensor faces,
+         at::Tensor voxels) {
+     CHECK_INPUT(faces);
+     CHECK_INPUT(voxels);
++    CHECK_FLOATING(faces);
++    CHECK_INT32(voxels);
++    CHECK_SAME_DEVICE(faces, voxels);
+ 
++    const c10::cuda::CUDAGuard device_guard(faces.device());
+     return voxelize_sub1_cuda(faces, voxels);
+ }
+ 
+@@ -48,7 +53,11 @@
+         at::Tensor voxels) {
+     CHECK_INPUT(faces);
+     CHECK_INPUT(voxels);
++    CHECK_FLOATING(faces);
++    CHECK_INT32(voxels);
++    CHECK_SAME_DEVICE(faces, voxels);
+ 
++    const c10::cuda::CUDAGuard device_guard(faces.device());
+     return voxelize_sub2_cuda(faces, voxels);
+ }
+ 
+@@ -59,7 +68,13 @@
+     CHECK_INPUT(faces);
+     CHECK_INPUT(voxels);
+     CHECK_INPUT(visible);
++    CHECK_FLOATING(faces);
++    CHECK_INT32(voxels);
++    CHECK_INT32(visible);
++    CHECK_SAME_DEVICE(faces, voxels);
++    CHECK_SAME_DEVICE(faces, visible);
+ 
++    const c10::cuda::CUDAGuard device_guard(faces.device());
+     return voxelize_sub3_cuda(faces, voxels, visible);
+ }
+ 
+@@ -70,10 +85,15 @@
+     CHECK_INPUT(faces);
+     CHECK_INPUT(voxels);
+     CHECK_INPUT(visible);
++    CHECK_FLOATING(faces);
++    CHECK_INT32(voxels);
++    CHECK_INT32(visible);
++    CHECK_SAME_DEVICE(faces, voxels);
++    CHECK_SAME_DEVICE(faces, visible);
+ 
++    const c10::cuda::CUDAGuard device_guard(faces.device());
+     return voxelize_sub4_cuda(faces, voxels, visible);
+ }
+-
+ 
+ PYBIND11_MODULE(voxelization, m) {
+     m.def("voxelize_sub1", &voxelize_sub1, "VOXELIZE_SUB1 (CUDA)");
+--- a/soft_renderer/cuda/voxelization_cuda_kernel.cu
++++ b/soft_renderer/cuda/voxelization_cuda_kernel.cu
+@@ -1,5 +1,10 @@
+ #include <iostream>
+ #include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++
++#include <c10/cuda/CUDAException.h>
++
++#include <cmath>
+ 
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -7,7 +12,7 @@
+ #include <stdio.h>
+ 
+ // for the older gpus atomicAdd with double arguments does not exist
+-#if  __CUDA_ARCH__ < 600 and defined(__CUDA_ARCH__)
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 600)
+ static __inline__ __device__ double atomicAdd(double* address, double val) {
+     unsigned long long int* address_as_ull = (unsigned long long int*)address;
+     unsigned long long int old = *address_as_ull, assumed;
+@@ -202,7 +207,8 @@
+     const dim3 blocks ((batch_size * voxel_size * voxel_size - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "voxelize_sub1_cuda", ([&] {
+-      voxelize_sub1_kernel<scalar_t><<<blocks, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      voxelize_sub1_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           faces.data_ptr<scalar_t>(),
+           voxels.data_ptr<int32_t>(),
+           batch_size,
+@@ -210,9 +216,7 @@
+           voxel_size);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in voxelize_sub1_kernel: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {voxels};
+ }
+@@ -230,7 +234,8 @@
+     const dim3 blocks ((batch_size * num_faces - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "voxelize_sub2_cuda", ([&] {
+-      voxelize_sub2_kernel<scalar_t><<<blocks, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      voxelize_sub2_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           faces.data_ptr<scalar_t>(),
+           voxels.data_ptr<int32_t>(),
+           batch_size,
+@@ -238,9 +243,7 @@
+           voxel_size);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in voxelize_sub2_kernel: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {voxels};
+ }
+@@ -256,16 +259,15 @@
+     const dim3 blocks ((batch_size * voxel_size  * voxel_size  * voxel_size - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "voxelize_sub3_cuda", ([&] {
+-      voxelize_sub3_kernel<scalar_t><<<blocks, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      voxelize_sub3_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           voxels.data_ptr<int32_t>(),
+           visible.data_ptr<int32_t>(),
+           batch_size,
+           voxel_size);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in voxelize_sub3_kernel: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {voxels, visible};
+ }
+@@ -281,16 +283,15 @@
+     const dim3 blocks ((batch_size * voxel_size  * voxel_size  * voxel_size - 1) / threads +1);
+ 
+     AT_DISPATCH_FLOATING_TYPES(faces.scalar_type(), "voxelize_sub4_cuda", ([&] {
+-      voxelize_sub4_kernel<scalar_t><<<blocks, threads>>>(
++      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++      voxelize_sub4_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           voxels.data_ptr<int32_t>(),
+           visible.data_ptr<int32_t>(),
+           batch_size,
+           voxel_size);
+       }));
+ 
+-    cudaError_t err = cudaGetLastError();
+-    if (err != cudaSuccess) 
+-            printf("Error in voxelize_sub4_kernel: %s\n", cudaGetErrorString(err));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
+ 
+     return {voxels, visible};
+ }--- a/soft_renderer/functional/ambient_lighting.py
++++ b/soft_renderer/functional/ambient_lighting.py
+@@ -1,18 +1,20 @@
++import numpy as np
+ import torch
+-import torch.nn as nn
+-import torch.nn.functional as F
+-import numpy as np
+ 
+ 
+ def ambient_lighting(light, light_intensity=0.5, light_color=(1, 1, 1)):
+     device = light.device
++    dtype = light.dtype
+ 
+-    if isinstance(light_color, tuple) or isinstance(light_color, list):
+-        light_color = torch.tensor(light_color, dtype=torch.float32, device=device)
++    if isinstance(light_color, (tuple, list)):
++        light_color = torch.tensor(light_color, dtype=dtype, device=device)
+     elif isinstance(light_color, np.ndarray):
+-        light_color = torch.from_numpy(light_color).float().to(device)
++        light_color = torch.from_numpy(light_color).to(device=device, dtype=dtype)
++    else:
++        light_color = light_color.to(device=device, dtype=dtype)
++
+     if light_color.ndimension() == 1:
+         light_color = light_color[None, :]
+ 
+-    light += light_intensity * light_color[:, None, :]
++    light = light + light_intensity * light_color[:, None, :]
+     return light  # [nb, :, 3]
+--- a/soft_renderer/functional/directional_lighting.py
++++ b/soft_renderer/functional/directional_lighting.py
+@@ -1,28 +1,33 @@
++import numpy as np
+ import torch
+-import torch.nn as nn
+ import torch.nn.functional as F
+-import numpy as np
+ 
+ 
+ def directional_lighting(light, normals, light_intensity=0.5, light_color=(1, 1, 1),
+                          light_direction=(0, 1, 0)):
+     # normals: [nb, :, 3]
++    device = light.device
++    dtype = light.dtype
+ 
+-    device = light.device
++    if isinstance(light_color, (tuple, list)):
++        light_color = torch.tensor(light_color, dtype=dtype, device=device)
++    elif isinstance(light_color, np.ndarray):
++        light_color = torch.from_numpy(light_color).to(device=device, dtype=dtype)
++    else:
++        light_color = light_color.to(device=device, dtype=dtype)
+ 
+-    if isinstance(light_color, tuple) or isinstance(light_color, list):
+-        light_color = torch.tensor(light_color, dtype=torch.float32, device=device)
+-    elif isinstance(light_color, np.ndarray):
+-        light_color = torch.from_numpy(light_color).float().to(device)
+-    if isinstance(light_direction, tuple) or isinstance(light_direction, list):
+-        light_direction = torch.tensor(light_direction, dtype=torch.float32, device=device)
++    if isinstance(light_direction, (tuple, list)):
++        light_direction = torch.tensor(light_direction, dtype=dtype, device=device)
+     elif isinstance(light_direction, np.ndarray):
+-        light_direction = torch.from_numpy(light_direction).float().to(device)
++        light_direction = torch.from_numpy(light_direction).to(device=device, dtype=dtype)
++    else:
++        light_direction = light_direction.to(device=device, dtype=dtype)
++
+     if light_color.ndimension() == 1:
+         light_color = light_color[None, :]
+     if light_direction.ndimension() == 1:
+         light_direction = light_direction[None, :]  # [nb, 3]
+ 
+-    cosine = F.relu(torch.sum(normals * light_direction, dim=2))  # []
+-    light += light_intensity * (light_color[:, None, :] * cosine[:, :, None])
++    cosine = F.relu(torch.sum(normals * light_direction, dim=2))
++    light = light + light_intensity * (light_color[:, None, :] * cosine[:, :, None])
+     return light  # [nb, :, 3]
+--- a/soft_renderer/functional/load_obj.py
++++ b/soft_renderer/functional/load_obj.py
+@@ -1,10 +1,14 @@
+ import os
+ 
++import numpy as np
+ import torch
+-import numpy as np
+ from skimage.io import imread
+ 
+ import soft_renderer.cuda.load_textures as load_textures_cuda
++
++
++def _default_device():
++    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ 
+ 
+ def load_mtl(filename_mtl):
+@@ -27,6 +31,8 @@
+ 
+ 
+ def load_textures(filename_obj, filename_mtl, texture_res):
++    device = _default_device()
++
+     # load vertices
+     vertices = []
+     with open(filename_obj) as f:
+@@ -67,17 +73,15 @@
+             material_name = line.split()[1]
+     faces = np.vstack(faces).astype(np.int32) - 1
+     faces = vertices[faces]
+-    faces = torch.from_numpy(faces).cuda()
++    faces = torch.from_numpy(faces).to(device)
+     faces[1 < faces] = faces[1 < faces] % 1
+ 
+     colors, texture_filenames = load_mtl(filename_mtl)
+ 
+-    textures = torch.ones(faces.shape[0], texture_res**2, 3, dtype=torch.float32)
+-    textures = textures.cuda()
++    textures = torch.ones(faces.shape[0], texture_res ** 2, 3, dtype=torch.float32, device=device)
+ 
+-    #
+     for material_name, color in list(colors.items()):
+-        color = torch.from_numpy(color).cuda()
++        color = torch.from_numpy(color).to(device)
+         for i, material_name_f in enumerate(material_names):
+             if material_name == material_name_f:
+                 textures[i, :, :] = color[None, :]
+@@ -88,17 +92,22 @@
+ 
+         # texture image may have one channel (grey color)
+         if len(image.shape) == 2:
+-            image = np.stack((image,)*3, -1)
++            image = np.stack((image,) * 3, -1)
+         # or has extral alpha channel shoule ignore for now
+         if image.shape[2] == 4:
+             image = image[:, :, :3]
+ 
+         # pytorch does not support negative slicing for the moment
+         image = image[::-1, :, :]
+-        image = torch.from_numpy(image.copy()).cuda()
++        image = torch.from_numpy(image.copy()).to(device)
+         is_update = (np.array(material_names) == material_name).astype(np.int32)
+-        is_update = torch.from_numpy(is_update).cuda()
+-        textures = load_textures_cuda.load_textures(image, faces, textures, is_update)
++        is_update = torch.from_numpy(is_update).to(device)
++        textures = load_textures_cuda.load_textures(
++            image.contiguous(),
++            faces.contiguous(),
++            textures.contiguous(),
++            is_update.contiguous(),
++        )
+     return textures
+ 
+ 
+@@ -109,6 +118,7 @@
+     """
+ 
+     assert texture_type in ['surface', 'vertex']
++    device = _default_device()
+ 
+     # load vertices
+     vertices = []
+@@ -120,7 +130,7 @@
+             continue
+         if line.split()[0] == 'v':
+             vertices.append([float(v) for v in line.split()[1:4]])
+-    vertices = torch.from_numpy(np.vstack(vertices).astype(np.float32)).cuda()
++    vertices = torch.from_numpy(np.vstack(vertices).astype(np.float32)).to(device)
+ 
+     # load faces
+     faces = []
+@@ -135,7 +145,7 @@
+                 v1 = int(vs[i + 1].split('/')[0])
+                 v2 = int(vs[i + 2].split('/')[0])
+                 faces.append((v0, v1, v2))
+-    faces = torch.from_numpy(np.vstack(faces).astype(np.int32)).cuda() - 1
++    faces = torch.from_numpy(np.vstack(faces).astype(np.int32)).to(device) - 1
+ 
+     # load textures
+     if load_texture and texture_type == 'surface':
+@@ -153,7 +163,7 @@
+                 continue
+             if line.split()[0] == 'v':
+                 textures.append([float(v) for v in line.split()[4:7]])
+-        textures = torch.from_numpy(np.vstack(textures).astype(np.float32)).cuda()
++        textures = torch.from_numpy(np.vstack(textures).astype(np.float32)).to(device)
+ 
+     # normalize into a unit cube centered zero
+     if normalization:
+--- a/soft_renderer/functional/look.py
++++ b/soft_renderer/functional/look.py
+@@ -7,24 +7,27 @@
+     """
+     "Look" transformation of vertices.
+     """
+-    if (vertices.ndimension() != 3):
++    if vertices.ndimension() != 3:
+         raise ValueError('vertices Tensor should have 3 dimensions')
+ 
+     device = vertices.device
++    dtype = vertices.dtype
+ 
+-    if isinstance(direction, list) or isinstance(direction, tuple):
+-        direction = torch.tensor(direction, dtype=torch.float32, device=device)
+-    elif isinstance(direction, np.ndarray):
+-        direction = torch.from_numpy(direction).to(device)
+-    elif torch.is_tensor(direction):
+-        direction.to(device)
++    def _to_tensor(value):
++        if isinstance(value, (list, tuple)):
++            return torch.tensor(value, dtype=dtype, device=device)
++        if isinstance(value, np.ndarray):
++            return torch.from_numpy(value).to(device=device, dtype=dtype)
++        if torch.is_tensor(value):
++            return value.to(device=device, dtype=dtype)
++        raise TypeError('Expected a list, tuple, numpy.ndarray, or torch.Tensor')
+ 
+-    if isinstance(eye, list) or isinstance(eye, tuple):
+-        eye = torch.tensor(eye, dtype=torch.float32, device=device)
+-    elif isinstance(eye, np.ndarray):
+-        eye = torch.from_numpy(eye).to(device)
+-    elif torch.is_tensor(eye):
+-        eye = eye.to(device)
++    if up is None:
++        up = [0, 1, 0]
++
++    direction = _to_tensor(direction)
++    eye = _to_tensor(eye)
++    up = _to_tensor(up)
+ 
+     if eye.ndimension() == 1:
+         eye = eye[None, :]
+@@ -34,9 +37,9 @@
+         up = up[None, :]
+ 
+     # create new axes
+-    z_axis = F.normalize(direction, eps=1e-5)
+-    x_axis = F.normalize(torch.cross(up, z_axis), eps=1e-5)
+-    y_axis = F.normalize(torch.cross(z_axis, x_axis), eps=1e-5)
++    z_axis = F.normalize(direction, eps=1e-5, dim=1)
++    x_axis = F.normalize(torch.cross(up, z_axis, dim=1), eps=1e-5, dim=1)
++    y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=1), eps=1e-5, dim=1)
+ 
+     # create rotation matrix: [bs, 3, 3]
+     r = torch.cat((x_axis[:, None, :], y_axis[:, None, :], z_axis[:, None, :]), dim=1)
+--- a/soft_renderer/functional/look_at.py
++++ b/soft_renderer/functional/look_at.py
+@@ -7,33 +7,24 @@
+     """
+     "Look at" transformation of vertices.
+     """
+-    if (vertices.ndimension() != 3):
++    if vertices.ndimension() != 3:
+         raise ValueError('vertices Tensor should have 3 dimensions')
+ 
+     device = vertices.device
++    dtype = vertices.dtype
+ 
+-    # if list or tuple convert to numpy array
+-    if isinstance(at, list) or isinstance(at, tuple):
+-        at = torch.tensor(at, dtype=torch.float32, device=device)
+-    # if numpy array convert to tensor
+-    elif isinstance(at, np.ndarray):
+-        at = torch.from_numpy(at).to(device)
+-    elif torch.is_tensor(at):
+-        at.to(device)
++    def _to_tensor(value):
++        if isinstance(value, (list, tuple)):
++            return torch.tensor(value, dtype=dtype, device=device)
++        if isinstance(value, np.ndarray):
++            return torch.from_numpy(value).to(device=device, dtype=dtype)
++        if torch.is_tensor(value):
++            return value.to(device=device, dtype=dtype)
++        raise TypeError('Expected a list, tuple, numpy.ndarray, or torch.Tensor')
+ 
+-    if isinstance(up, list) or isinstance(up, tuple):
+-        up = torch.tensor(up, dtype=torch.float32, device=device)
+-    elif isinstance(up, np.ndarray):
+-        up = torch.from_numpy(up).to(device)
+-    elif torch.is_tensor(up):
+-        up.to(device)
+-
+-    if isinstance(eye, list) or isinstance(eye, tuple):
+-        eye = torch.tensor(eye, dtype=torch.float32, device=device)
+-    elif isinstance(eye, np.ndarray):
+-        eye = torch.from_numpy(eye).to(device)
+-    elif torch.is_tensor(eye):
+-        eye = eye.to(device)
++    at = _to_tensor(at)
++    up = _to_tensor(up)
++    eye = _to_tensor(eye)
+ 
+     batch_size = vertices.shape[0]
+     if eye.ndimension() == 1:
+@@ -45,9 +36,9 @@
+ 
+     # create new axes
+     # eps is chosen as 1e-5 to match the chainer version
+-    z_axis = F.normalize(at - eye, eps=1e-5)
+-    x_axis = F.normalize(torch.cross(up, z_axis, dim=1), eps=1e-5)
+-    y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=1), eps=1e-5)
++    z_axis = F.normalize(at - eye, eps=1e-5, dim=1)
++    x_axis = F.normalize(torch.cross(up, z_axis, dim=1), eps=1e-5, dim=1)
++    y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=1), eps=1e-5, dim=1)
+ 
+     # create rotation matrix: [bs, 3, 3]
+     r = torch.cat((x_axis[:, None, :], y_axis[:, None, :], z_axis[:, None, :]), dim=1)
+--- a/soft_renderer/functional/save_obj.py
++++ b/soft_renderer/functional/save_obj.py
+@@ -4,6 +4,12 @@
+ from skimage.io import imsave
+ 
+ import soft_renderer.cuda.create_texture_image as create_texture_image_cuda
++
++
++def _extension_device(tensor=None):
++    if tensor is not None and torch.is_tensor(tensor) and tensor.is_cuda:
++        return tensor.device
++    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ 
+ 
+ def create_texture_image(textures, texture_res=16):
+@@ -21,10 +27,17 @@
+     vertices[:, 1, 1] = (row + 1) * texture_res - 1 - 1
+     vertices[:, 2, 0] = (column + 1) * texture_res - 1 - 1
+     vertices[:, 2, 1] = (row + 1) * texture_res - 1 - 1
+-    image = image.cuda()
+-    vertices = vertices.cuda()
+-    textures = textures.cuda()
+-    image = create_texture_image_cuda.create_texture_image(vertices, textures, image, 1e-5)
++
++    device = _extension_device(textures)
++    image = image.to(device)
++    vertices = vertices.to(device)
++    textures = textures.to(device)
++    image = create_texture_image_cuda.create_texture_image(
++        vertices.contiguous(),
++        textures.contiguous(),
++        image.contiguous(),
++        1e-5,
++    )
+ 
+     vertices[:, :, 0] /= (image.shape[1] - 1)
+     vertices[:, :, 1] /= (image.shape[0] - 1)
+@@ -42,6 +55,11 @@
+     assert texture_type in ['surface', 'vertex']
+     assert texture_res >= 2
+ 
++    filename_mtl = None
++    filename_texture = None
++    material_name = None
++    vertices_textures = None
++
+     if textures is not None and texture_type == 'surface':
+         filename_mtl = filename[:-4] + '.mtl'
+         filename_texture = filename[:-4] + '.png'
+@@ -51,23 +69,25 @@
+         texture_image = (texture_image * 255).astype('uint8')
+         imsave(filename_texture, texture_image)
+ 
+-    faces = faces.detach().cpu().numpy()
++    vertices_np = vertices.detach().cpu().numpy()
++    faces_np = faces.detach().cpu().numpy()
++    textures_np = None if textures is None else textures.detach().cpu().numpy()
+ 
+     with open(filename, 'w') as f:
+         f.write('# %s\n' % os.path.basename(filename))
+         f.write('#\n')
+         f.write('\n')
+ 
+-        if textures is not None:
++        if filename_mtl is not None:
+             f.write('mtllib %s\n\n' % os.path.basename(filename_mtl))
+ 
+         if textures is not None and texture_type == 'vertex':
+-            for vertex, color in zip(vertices, textures):
++            for vertex, color in zip(vertices_np, textures_np):
+                 f.write('v %.8f %.8f %.8f %.8f %.8f %.8f\n' % (vertex[0], vertex[1], vertex[2],
+                                                                color[0], color[1], color[2]))
+             f.write('\n')
+         else:
+-            for vertex in vertices:
++            for vertex in vertices_np:
+                 f.write('v %.8f %.8f %.8f\n' % (vertex[0], vertex[1], vertex[2]))
+             f.write('\n')
+ 
+@@ -77,15 +97,15 @@
+             f.write('\n')
+ 
+             f.write('usemtl %s\n' % material_name)
+-            for i, face in enumerate(faces):
++            for i, face in enumerate(faces_np):
+                 f.write('f %d/%d %d/%d %d/%d\n' % (
+                     face[0] + 1, 3 * i + 1, face[1] + 1, 3 * i + 2, face[2] + 1, 3 * i + 3))
+             f.write('\n')
+         else:
+-            for face in faces:
++            for face in faces_np:
+                 f.write('f %d %d %d\n' % (face[0] + 1, face[1] + 1, face[2] + 1))
+ 
+-    if textures is not None and texture_type == 'surface':
++    if filename_mtl is not None:
+         with open(filename_mtl, 'w') as f:
+             f.write('newmtl %s\n' % material_name)
+             f.write('map_Kd %s\n' % os.path.basename(filename_texture))
+@@ -98,5 +118,6 @@
+             for k in range(voxel.shape[2]):
+                 if voxel[i, j, k] == 1:
+                     vertices.append([i / voxel.shape[0], j / voxel.shape[1], k / voxel.shape[2]])
+-    vertices = torch.autograd.Variable(torch.tensor(vertices))
+-    return save_obj(filename, vertices, torch.autograd.Variable(torch.tensor([])))
++    vertices = torch.tensor(vertices, dtype=torch.float32)
++    faces = torch.empty((0, 3), dtype=torch.int32)
++    return save_obj(filename, vertices, faces)
+--- a/soft_renderer/functional/soft_rasterize.py
++++ b/soft_renderer/functional/soft_rasterize.py
+@@ -1,8 +1,7 @@
++import numpy as np
+ import torch
+-import torch.nn as nn
+-import torch.nn.functional as F
+ from torch.autograd import Function
+-import numpy as np
++
+ import soft_renderer.cuda.soft_rasterize as soft_rasterize_cuda
+ 
+ 
+@@ -32,43 +31,58 @@
+         ctx.sigma_val = sigma_val
+         ctx.gamma_val = gamma_val
+         ctx.func_dist_type = func_dist_map[dist_func]
+-        ctx.dist_eps = np.log(1. / dist_eps - 1.)
++        ctx.dist_eps = float(np.log(1. / dist_eps - 1.))
+         ctx.func_rgb_type = func_rgb_map[aggr_func_rgb]
+         ctx.func_alpha_type = func_alpha_map[aggr_func_alpha]
+         ctx.texture_type = func_map_sample[texture_type]
+         ctx.fill_back = fill_back
+ 
+-        face_vertices = face_vertices.clone()
+-        textures = textures.clone()
++        face_vertices = face_vertices.contiguous()
++        textures = textures.contiguous()
+ 
+         ctx.device = face_vertices.device
+         ctx.batch_size, ctx.num_faces = face_vertices.shape[:2]
+ 
++        dtype = face_vertices.dtype
+         faces_info = torch.zeros(
+-            (ctx.batch_size, ctx.num_faces, 9*3),
+-            dtype=torch.float32,
+-            device=ctx.device)  # [inv*9, sym*9, obt*3, 0*6]
++            (ctx.batch_size, ctx.num_faces, 9 * 3),
++            dtype=dtype,
++            device=ctx.device,
++        )  # [inv*9, sym*9, obt*3, 0*6]
+         aggrs_info = torch.zeros(
+             (ctx.batch_size, 2, ctx.image_size, ctx.image_size),
+-            dtype=torch.float32,
+-            device=ctx.device)
++            dtype=dtype,
++            device=ctx.device,
++        )
+         soft_colors = torch.ones(
+             (ctx.batch_size, 4, ctx.image_size, ctx.image_size),
+-            dtype=torch.float32,
+-            device=ctx.device)
++            dtype=dtype,
++            device=ctx.device,
++        )
+ 
+         soft_colors[:, 0, :, :] *= background_color[0]
+         soft_colors[:, 1, :, :] *= background_color[1]
+         soft_colors[:, 2, :, :] *= background_color[2]
+ 
+-        faces_info, aggrs_info, soft_colors = \
+-            soft_rasterize_cuda.forward_soft_rasterize(face_vertices, textures,
+-                                                       faces_info, aggrs_info,
+-                                                       soft_colors,
+-                                                       image_size, near, far, eps,
+-                                                       sigma_val, ctx.func_dist_type, ctx.dist_eps,
+-                                                       gamma_val, ctx.func_rgb_type, ctx.func_alpha_type,
+-                                                       ctx.texture_type, fill_back)
++        faces_info, aggrs_info, soft_colors = soft_rasterize_cuda.forward_soft_rasterize(
++            face_vertices,
++            textures,
++            faces_info,
++            aggrs_info,
++            soft_colors,
++            image_size,
++            near,
++            far,
++            eps,
++            sigma_val,
++            ctx.func_dist_type,
++            ctx.dist_eps,
++            gamma_val,
++            ctx.func_rgb_type,
++            ctx.func_alpha_type,
++            ctx.texture_type,
++            fill_back,
++        )
+ 
+         ctx.save_for_backward(face_vertices, textures, soft_colors, faces_info, aggrs_info)
+         return soft_colors
+@@ -78,7 +92,6 @@
+ 
+         face_vertices, textures, soft_colors, faces_info, aggrs_info = ctx.saved_tensors
+         image_size = ctx.image_size
+-        background_color = ctx.background_color
+         near = ctx.near
+         far = ctx.far
+         eps = ctx.eps
+@@ -91,22 +104,32 @@
+         texture_type = ctx.texture_type
+         fill_back = ctx.fill_back
+ 
+-        grad_faces = torch.zeros_like(face_vertices,
+-                                      dtype=torch.float32,
+-                                      device=ctx.device)
+-        grad_textures = torch.zeros_like(textures,
+-                                         dtype=torch.float32,
+-                                         device=ctx.device)
++        grad_faces = torch.zeros_like(face_vertices, dtype=face_vertices.dtype, device=ctx.device)
++        grad_textures = torch.zeros_like(textures, dtype=textures.dtype, device=ctx.device)
+         grad_soft_colors = grad_soft_colors.contiguous()
+ 
+-        grad_faces, grad_textures = \
+-            soft_rasterize_cuda.backward_soft_rasterize(face_vertices, textures, soft_colors,
+-                                                        faces_info, aggrs_info,
+-                                                        grad_faces, grad_textures, grad_soft_colors,
+-                                                        image_size, near, far, eps,
+-                                                        sigma_val, func_dist_type, dist_eps,
+-                                                        gamma_val, func_rgb_type, func_alpha_type,
+-                                                        texture_type, fill_back)
++        grad_faces, grad_textures = soft_rasterize_cuda.backward_soft_rasterize(
++            face_vertices,
++            textures,
++            soft_colors,
++            faces_info,
++            aggrs_info,
++            grad_faces,
++            grad_textures,
++            grad_soft_colors,
++            image_size,
++            near,
++            far,
++            eps,
++            sigma_val,
++            func_dist_type,
++            dist_eps,
++            gamma_val,
++            func_rgb_type,
++            func_alpha_type,
++            texture_type,
++            fill_back,
++        )
+ 
+         return grad_faces, grad_textures, None, None, None, None, None, None, None, None, None, None, None, None, None
+ 
+@@ -117,8 +140,12 @@
+                    sigma_val=1e-5, dist_func='euclidean', dist_eps=1e-4,
+                    gamma_val=1e-4, aggr_func_rgb='softmax', aggr_func_alpha='prod',
+                    texture_type='surface'):
+-    if face_vertices.device == "cpu":
++    if face_vertices.device.type == 'cpu':
+         raise TypeError('Rasterize module supports only cuda Tensors')
++    if textures.device != face_vertices.device:
++        raise TypeError('face_vertices and textures must be on the same device')
++    if textures.dtype != face_vertices.dtype:
++        raise TypeError('face_vertices and textures must have the same dtype')
+ 
+     return SoftRasterizeFunction.apply(face_vertices, textures, image_size,
+                                        background_color, near, far,
+--- a/soft_renderer/functional/vertex_normals.py
++++ b/soft_renderer/functional/vertex_normals.py
+@@ -8,18 +8,17 @@
+     :param faces: [batch size, number of faces, 3]
+     :return: [batch size, number of vertices, 3]
+     """
+-    assert (vertices.ndimension() == 3)
+-    assert (faces.ndimension() == 3)
+-    assert (vertices.shape[0] == faces.shape[0])
+-    assert (vertices.shape[2] == 3)
+-    assert (faces.shape[2] == 3)
++    assert vertices.ndimension() == 3
++    assert faces.ndimension() == 3
++    assert vertices.shape[0] == faces.shape[0]
++    assert vertices.shape[2] == 3
++    assert faces.shape[2] == 3
+ 
+     bs, nv = vertices.shape[:2]
+-    bs, nf = faces.shape[:2]
+     device = vertices.device
+-    normals = torch.zeros(bs * nv, 3).to(device)
++    normals = torch.zeros(bs * nv, 3, device=device, dtype=vertices.dtype)
+ 
+-    faces = faces + (torch.arange(bs, dtype=torch.int32).to(device) * nv)[:, None, None]  # expanded faces
++    faces = faces + (torch.arange(bs, dtype=torch.int32, device=device) * nv)[:, None, None]  # expanded faces
+     vertices_faces = vertices.reshape((bs * nv, 3))[faces.long()]
+ 
+     faces = faces.view(-1, 3)
+@@ -27,13 +26,13 @@
+ 
+     normals.index_add_(0, faces[:, 1].long(),
+                        torch.cross(vertices_faces[:, 2] - vertices_faces[:, 1],
+-                                   vertices_faces[:, 0] - vertices_faces[:, 1]))
++                                   vertices_faces[:, 0] - vertices_faces[:, 1], dim=1))
+     normals.index_add_(0, faces[:, 2].long(),
+                        torch.cross(vertices_faces[:, 0] - vertices_faces[:, 2],
+-                                   vertices_faces[:, 1] - vertices_faces[:, 2]))
++                                   vertices_faces[:, 1] - vertices_faces[:, 2], dim=1))
+     normals.index_add_(0, faces[:, 0].long(),
+                        torch.cross(vertices_faces[:, 1] - vertices_faces[:, 0],
+-                                   vertices_faces[:, 2] - vertices_faces[:, 0]))
++                                   vertices_faces[:, 2] - vertices_faces[:, 0], dim=1))
+ 
+     normals = F.normalize(normals, eps=1e-6, dim=1)
+     normals = normals.reshape((bs, nv, 3))
+--- a/soft_renderer/functional/voxelization.py
++++ b/soft_renderer/functional/voxelization.py
+@@ -1,43 +1,36 @@
+ import torch
+-import torch.nn as nn
+-import torch.nn.functional as F
+-from torch.autograd import Function
+ 
+ import soft_renderer.cuda.voxelization as voxelization_cuda
+ 
+ 
+ def voxelize_sub1(faces, size, dim):
+     bs = faces.size(0)
+-    nf = faces.size(1)
+     if dim == 0:
+         faces = faces[:, :, :, [2, 1, 0]].contiguous()
+     elif dim == 1:
+         faces = faces[:, :, :, [0, 2, 1]].contiguous()
+-    voxels = torch.zeros(bs, size, size, size).int().cuda()
++    voxels = torch.zeros(bs, size, size, size, dtype=torch.int32, device=faces.device)
+     return voxelization_cuda.voxelize_sub1(faces, voxels)[0].transpose(dim + 1, -1)
+ 
+ 
+ def voxelize_sub2(faces, size):
+     bs = faces.size(0)
+-    nf = faces.size(1)
+-    voxels = torch.zeros(bs, size, size, size).int().cuda()
++    voxels = torch.zeros(bs, size, size, size, dtype=torch.int32, device=faces.device)
+     return voxelization_cuda.voxelize_sub2(faces, voxels)[0]
+ 
+ 
+ def voxelize_sub3(faces, voxels):
+-    bs = voxels.size(0)
+-    vs = voxels.size(1)
+-    visible = torch.zeros_like(voxels, dtype=torch.int32).cuda()
++    visible = torch.zeros_like(voxels, dtype=torch.int32, device=voxels.device)
+     voxels, visible = voxelization_cuda.voxelize_sub3(faces, voxels, visible)
+ 
+-    sum_visible = visible.sum()
++    sum_visible = visible.sum().item()
+ 
+     while True:
+         voxels, visible = voxelization_cuda.voxelize_sub4(faces, voxels, visible)
+-        if visible.sum() == sum_visible:
++        current_visible = visible.sum().item()
++        if current_visible == sum_visible:
+             break
+-        else:
+-            sum_visible = visible.sum()
++        sum_visible = current_visible
+     return 1 - visible
+ 
+ 
+@@ -54,7 +47,7 @@
+     voxels3 = voxelize_sub2(faces, size)
+ 
+     voxels = voxels0 + voxels1 + voxels2 + voxels3
+-    voxels = (voxels > 0).int().contiguous()
++    voxels = (voxels > 0).to(dtype=torch.int32).contiguous()
+     voxels = voxelize_sub3(faces, voxels)
+ 
+     return voxels
+--- a/soft_renderer/lighting.py
++++ b/soft_renderer/lighting.py
+@@ -45,16 +45,22 @@
+ 
+     def forward(self, mesh):
+         if mesh.texture_type == 'surface':
+-            light = torch.zeros_like(mesh.faces, dtype=torch.float32).to(mesh.device)
+-            light = light.contiguous()
++            light = torch.zeros(
++                mesh.faces.shape,
++                dtype=mesh.textures.dtype,
++                device=mesh.device,
++            ).contiguous()
+             light = self.ambient(light)
+             for directional in self.directionals:
+                 light = directional(light, mesh.surface_normals)
+             new_textures = mesh.textures * light[:, :, None, :]
+ 
+         elif mesh.texture_type == 'vertex':
+-            light = torch.zeros_like(mesh.vertices, dtype=torch.float32).to(mesh.device)
+-            light = light.contiguous()
++            light = torch.zeros(
++                mesh.vertices.shape,
++                dtype=mesh.textures.dtype,
++                device=mesh.device,
++            ).contiguous()
+             light = self.ambient(light)
+             for directional in self.directionals:
+                 light = directional(light, mesh.vertex_normals)
+--- a/soft_renderer/mesh.py
++++ b/soft_renderer/mesh.py
+@@ -1,9 +1,12 @@
++import numpy as np
+ import torch
+-import torch.nn as nn
+ import torch.nn.functional as F
+-import numpy as np
+ 
+ import soft_renderer.functional as srf
++
++
++def _default_device():
++    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ 
+ 
+ class Mesh(object):
+@@ -18,15 +21,18 @@
+         self._faces = faces
+ 
+         if isinstance(self._vertices, np.ndarray):
+-            self._vertices = torch.from_numpy(self._vertices).float().cuda()
++            self._vertices = torch.from_numpy(self._vertices).float().to(_default_device())
+         if isinstance(self._faces, np.ndarray):
+-            self._faces = torch.from_numpy(self._faces).int().cuda()
++            self._faces = torch.from_numpy(self._faces.astype(np.int32)).to(_default_device())
++
+         if self._vertices.ndimension() == 2:
+             self._vertices = self._vertices[None, :, :]
+         if self._faces.ndimension() == 2:
+             self._faces = self._faces[None, :, :]
+ 
+         self.device = self._vertices.device
++        self._vertices = self._vertices.to(self.device)
++        self._faces = self._faces.to(device=self.device, dtype=torch.int32).contiguous()
+         self.texture_type = texture_type
+ 
+         self.batch_size = self._vertices.shape[0]
+@@ -36,22 +42,40 @@
+         # create textures
+         if textures is None:
+             if texture_type == 'surface':
+-                self._textures = torch.ones(self.batch_size, self.num_faces, texture_res**2, 3,
+-                                            dtype=torch.float32).to(self.device)
++                self._textures = torch.ones(
++                    self.batch_size,
++                    self.num_faces,
++                    texture_res ** 2,
++                    3,
++                    dtype=self._vertices.dtype,
++                    device=self.device,
++                )
+                 self.texture_res = texture_res
+             elif texture_type == 'vertex':
+-                self._textures = torch.ones(self.batch_size, self.num_vertices, 3,
+-                                            dtype=torch.float32).to(self.device)
++                self._textures = torch.ones(
++                    self.batch_size,
++                    self.num_vertices,
++                    3,
++                    dtype=self._vertices.dtype,
++                    device=self.device,
++                )
+                 self.texture_res = 1  # vertex color doesn't need resolution
++            else:
++                raise ValueError('texture type not applicable')
+         else:
+             if isinstance(textures, np.ndarray):
+-                textures = torch.from_numpy(textures).float().cuda()
++                textures = torch.from_numpy(textures).float()
+             if textures.ndimension() == 3 and texture_type == 'surface':
+                 textures = textures[None, :, :, :]
+             if textures.ndimension() == 2 and texture_type == 'vertex':
+                 textures = textures[None, :, :]
+-            self._textures = textures
+-            self.texture_res = int(np.sqrt(self._textures.shape[2]))
++            self._textures = textures.to(self.device).contiguous()
++            if texture_type == 'surface':
++                self.texture_res = int(np.sqrt(self._textures.shape[2]))
++            elif texture_type == 'vertex':
++                self.texture_res = 1
++            else:
++                raise ValueError('texture type not applicable')
+ 
+     @classmethod
+     def from_obj(cls, filename_obj, normalization=False, load_texture=False, texture_res=1, texture_type='surface'):
+@@ -59,16 +83,20 @@
+         Create a Mesh object from a .obj file
+         '''
+         if load_texture:
+-            vertices, faces, textures = srf.load_obj(filename_obj,
+-                                                     normalization=normalization,
+-                                                     texture_res=texture_res,
+-                                                     load_texture=True,
+-                                                     texture_type=texture_type)
++            vertices, faces, textures = srf.load_obj(
++                filename_obj,
++                normalization=normalization,
++                texture_res=texture_res,
++                load_texture=True,
++                texture_type=texture_type,
++            )
+         else:
+-            vertices, faces = srf.load_obj(filename_obj,
+-                                           normalization=normalization,
+-                                           texture_res=texture_res,
+-                                           load_texture=False)
++            vertices, faces = srf.load_obj(
++                filename_obj,
++                normalization=normalization,
++                texture_res=texture_res,
++                load_texture=False,
++            )
+             textures = None
+         return cls(vertices, faces, textures, texture_res, texture_type)
+ 
+@@ -76,9 +104,14 @@
+         if self.batch_size != 1:
+             raise ValueError('Could not save when batch size > 1')
+         if save_texture:
+-            srf.save_obj(filename_obj, self.vertices[0], self.faces[0],
+-                         textures=self.textures[0],
+-                         texture_res=texture_res_out, texture_type=self.texture_type)
++            srf.save_obj(
++                filename_obj,
++                self.vertices[0],
++                self.faces[0],
++                textures=self.textures[0],
++                texture_res=texture_res_out,
++                texture_type=self.texture_type,
++            )
+         else:
+             srf.save_obj(filename_obj, self.vertices[0], self.faces[0], textures=None)
+ 
+@@ -102,7 +135,7 @@
+     def surface_normals(self):
+         v10 = self.face_vertices[:, :, 0] - self.face_vertices[:, :, 1]
+         v12 = self.face_vertices[:, :, 2] - self.face_vertices[:, :, 1]
+-        return F.normalize(torch.cross(v12, v10), p=2, dim=2, eps=1e-6)
++        return F.normalize(torch.cross(v12, v10, dim=2), p=2, dim=2, eps=1e-6)
+ 
+     @property
+     def vertex_normals(self):
+--- a/soft_renderer/transform.py
++++ b/soft_renderer/transform.py
+@@ -1,5 +1,5 @@
++import math
+ 
+-import math
+ import numpy as np
+ import torch
+ import torch.nn as nn
+@@ -12,13 +12,12 @@
+     '''
+     Compute perspective distortion from a given angle
+     '''
+-    if (vertices.ndimension() != 3):
++    if vertices.ndimension() != 3:
+         raise ValueError('vertices Tensor should have 3 dimensions')
+     device = vertices.device
+-    angle = torch.tensor(angle / 180 * math.pi, dtype=torch.float32, device=device)
+-    angle = angle[None]
+-    width = torch.tan(angle)
+-    width = width[:, None]
++    dtype = vertices.dtype
++    angle = torch.tensor(angle / 180 * math.pi, dtype=dtype, device=device)[None]
++    width = torch.tan(angle)[:, None]
+     z = vertices[:, :, 2]
+     x = vertices[:, :, 0] / z / width
+     y = vertices[:, :, 1] / z / width
+@@ -33,7 +32,7 @@
+     set scale = focal_pixel / object_depth  -- to 0~H/W pixel range
+               = 1 / ( object_depth * tan(half_fov_angle) ) -- to -1~1 pixel range
+     '''
+-    if (vertices.ndimension() != 3):
++    if vertices.ndimension() != 3:
+         raise ValueError('vertices Tensor should have 3 dimensions')
+     z = vertices[:, :, 2]
+     x = vertices[:, :, 0] * scale
+@@ -73,30 +72,40 @@
+         self.orig_size = orig_size
+ 
+         if isinstance(self.P, np.ndarray):
+-            self.P = torch.from_numpy(self.P).cuda()
++            self.P = torch.from_numpy(self.P).float()
++        elif torch.is_tensor(self.P):
++            self.P = self.P.float()
+         if self.P is None or self.P.ndimension() != 3 or self.P.shape[1] != 3 or self.P.shape[2] != 4:
+             raise ValueError('You need to provide a valid (batch_size)x3x4 projection matrix')
++
+         if dist_coeffs is None:
+-            self.dist_coeffs = torch.cuda.FloatTensor([[0., 0., 0., 0., 0.]]).repeat(self.P.shape[0], 1)
++            self.dist_coeffs = torch.zeros(self.P.shape[0], 5, dtype=self.P.dtype, device=self.P.device)
++        elif isinstance(dist_coeffs, np.ndarray):
++            self.dist_coeffs = torch.from_numpy(dist_coeffs).float()
++        elif torch.is_tensor(dist_coeffs):
++            self.dist_coeffs = dist_coeffs.float()
+ 
+     def transform(self, vertices):
++        P = self.P.to(device=vertices.device, dtype=vertices.dtype)
++        dist_coeffs = self.dist_coeffs.to(device=vertices.device, dtype=vertices.dtype)
++
+         vertices = torch.cat([vertices, torch.ones_like(vertices[:, :, None, 0])], dim=-1)
+-        vertices = torch.bmm(vertices, self.P.transpose(2, 1))
++        vertices = torch.bmm(vertices, P.transpose(2, 1))
+         x, y, z = vertices[:, :, 0], vertices[:, :, 1], vertices[:, :, 2]
+         x_ = x / (z + 1e-5)
+         y_ = y / (z + 1e-5)
+ 
+         # Get distortion coefficients from vector
+-        k1 = self.dist_coeffs[:, None, 0]
+-        k2 = self.dist_coeffs[:, None, 1]
+-        p1 = self.dist_coeffs[:, None, 2]
+-        p2 = self.dist_coeffs[:, None, 3]
+-        k3 = self.dist_coeffs[:, None, 4]
++        k1 = dist_coeffs[:, None, 0]
++        k2 = dist_coeffs[:, None, 1]
++        p1 = dist_coeffs[:, None, 2]
++        p2 = dist_coeffs[:, None, 3]
++        k3 = dist_coeffs[:, None, 4]
+ 
+         # we use x_ for x' and x__ for x'' etc.
+         r = torch.sqrt(x_ ** 2 + y_ ** 2)
+-        x__ = x_*(1 + k1*(r**2) + k2*(r**4) + k3*(r**6)) + 2*p1*x_*y_ + p2*(r**2 + 2*x_**2)
+-        y__ = y_*(1 + k1*(r**2) + k2*(r**4) + k3 * (r**6)) + p1*(r**2 + 2*y_**2) + 2*p2*x_*y_
++        x__ = x_ * (1 + k1 * (r ** 2) + k2 * (r ** 4) + k3 * (r ** 6)) + 2 * p1 * x_ * y_ + p2 * (r ** 2 + 2 * x_ ** 2)
++        y__ = y_ * (1 + k1 * (r ** 2) + k2 * (r ** 4) + k3 * (r ** 6)) + p1 * (r ** 2 + 2 * y_ ** 2) + 2 * p2 * x_ * y_
+         x__ = 2 * (x__ - self.orig_size / 2.) / self.orig_size
+         y__ = 2 * (y__ - self.orig_size / 2.) / self.orig_size
+         vertices = torch.stack([x__, y__, z], dim=-1)
+@@ -123,7 +132,7 @@
+ 
+     @property
+     def eyes(self):
+-        return self._eyes
++        return self._eye
+ 
+     def transform(self, vertices):
+         vertices = srf.look_at(vertices, self._eye)
+@@ -153,7 +162,7 @@
+ 
+     @property
+     def eyes(self):
+-        return self._eyes
++        return self._eye
+ 
+     def transform(self, vertices):
+         vertices = srf.look(vertices, self._eye, self.camera_direction)
